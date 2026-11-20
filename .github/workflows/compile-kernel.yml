@@ -200,7 +200,9 @@ jobs:
           kernel_auto: ${{ inputs.kernel_auto }}
           delete_source: ${{ inputs.delete_source }}
           kernel_package: ${{ inputs.kernel_package }}
-          kernel_sign: ${{ inputs.kernel_sign }}
+          # >>>
+          kernel_sign: ${{ inputs.kernel_sign == '-yourname' && format('-{0}', github.actor) || inputs.kernel_sign }}
+          # <<<
           kernel_toolchain: ${{ inputs.kernel_toolchain }}
           ccache_clear: ${{ inputs.ccache_clear }}
           docker_hostpath: /builder

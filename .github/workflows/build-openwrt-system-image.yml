@@ -580,7 +580,9 @@ jobs:
           auto_kernel: ${{ inputs.auto_kernel }}
           kernel_repo: ${{ inputs.kernel_repo }}
           kernel_usage: ${{ inputs.kernel_usage }}
-          builder_name: ${{ inputs.builder_name }}
+          # >>>
+          builder_name: ${{ inputs.builder_name == 'yourname' && github.actor || inputs.builder_name }}
+          # <<<
 
       - name: Upload packaged OpenWrt to Release
         uses: ophub/upload-to-releases@main

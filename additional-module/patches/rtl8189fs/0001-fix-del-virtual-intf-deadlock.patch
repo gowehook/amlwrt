@@ -1,0 +1,24 @@
+--- a/os_dep/linux/ioctl_cfg80211.c
++++ b/os_dep/linux/ioctl_cfg80211.c
+@@ -4843,8 +4843,21 @@
+ 			pwdev_priv->ifname_mon[0] = '\0';
+ 			RTW_INFO(FUNC_NDEV_FMT" remove monitor ndev\n", FUNC_NDEV_ARG(ndev));
+ 		} else {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0))
++			/*
++			 * Since 5.12 cfg80211 calls del_virtual_intf with the wiphy
++			 * mutex held, and the cfg80211 netdev notifier takes that same
++			 * (non-recursive) mutex on NETDEV_UNREGISTER. Unregistering the
++			 * netdev from here therefore self-deadlocks while holding RTNL,
++			 * which freezes nl80211/rtnetlink/LuCI/netifd.
++			 * Refuse to delete the driver-owned interface instead.
++			 */
++			RTW_INFO(FUNC_NDEV_FMT" delete not supported, ignore\n", FUNC_NDEV_ARG(ndev));
++			ret = -EOPNOTSUPP;
++#else
+ 			RTW_INFO(FUNC_NDEV_FMT" unregister ndev\n", FUNC_NDEV_ARG(ndev));
+ 			rtw_os_ndev_unregister(adapter);
++#endif
+ 		}
+ 	} else
+ #if defined(CONFIG_P2P) && defined(RTW_DEDICATED_P2P_DEVICE)
