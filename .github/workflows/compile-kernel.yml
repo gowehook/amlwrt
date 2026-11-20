@@ -86,6 +86,24 @@ on:
           - -ophub
           - -yourname
 
+      # >>> additional-module:inputs
+      mod_rtl8189fs:
+        description: "Additional module: RTL8189FS SDIO WiFi (8189fs.ko)"
+        required: false
+        default: false
+        type: boolean
+      mod_amneziawg:
+        description: "Additional module: AmneziaWG VPN (amneziawg.ko)"
+        required: false
+        default: false
+        type: boolean
+      mod_oaf:
+        description: "Additional module: OpenAppFilter kernel module (oaf.ko)"
+        required: false
+        default: false
+        type: boolean
+      # <<< additional-module:inputs
+
 env:
   TZ: Etc/UTC
 
@@ -198,7 +216,7 @@ jobs:
           kernel_source: ${{ inputs.kernel_source }}
           kernel_version: ${{ matrix.kernel_version }}
           kernel_auto: ${{ inputs.kernel_auto }}
-          delete_source: ${{ inputs.delete_source }}
+          delete_source: ${{ inputs.delete_source && !(inputs.mod_rtl8189fs || inputs.mod_amneziawg || inputs.mod_oaf) }}
           kernel_package: ${{ inputs.kernel_package }}
           # >>>
           kernel_sign: ${{ inputs.kernel_sign == '-yourname' && format('-{0}', github.actor) || inputs.kernel_sign }}
@@ -207,6 +225,16 @@ jobs:
           ccache_clear: ${{ inputs.ccache_clear }}
           docker_hostpath: /builder
           docker_image: ophub/armbian-${{ inputs.docker_image }}:arm64
+
+      # >>> additional-module:step
+      - name: Build additional modules
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        env:
+          ADDITIONAL_MODULES: ${{ inputs.mod_rtl8189fs && 'rtl8189fs ' || '' }}${{ inputs.mod_amneziawg && 'amneziawg ' || '' }}${{ inputs.mod_oaf && 'oaf ' || '' }}
+          DOCKER_IMAGE: ${{ inputs.docker_image }}
+          KERNEL_TOOLCHAIN: ${{ inputs.kernel_toolchain }}
+        run: bash additional-module/build.sh
+      # <<< additional-module:step
 
       - name: Upload Kernel to Release
         uses: ophub/upload-to-releases@main
