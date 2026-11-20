@@ -218,6 +218,7 @@ rebuild_firmware() {
         luci-proto-ncm luci-proto-openconnect luci-proto-ppp luci-proto-qmi luci-proto-relay \
         \
         luci-app-amlogic \
+        iperf3 openssh-sftp-server luci-app-nlbwmon nano htop kmod-tcp-bbr luci-app-pbr luci-app-sqm \
         \
         ${config_list} \
         "
