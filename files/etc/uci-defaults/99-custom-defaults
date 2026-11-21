@@ -1,0 +1,10 @@
+#!/bin/sh
+# Dijalankan SEKALI saat boot pertama (lalu dihapus otomatis). Ubah sesuai kebutuhan.
+uci -q batch <<'EOF'
+set system.@system[0].hostname='OpenWrt'
+set system.@system[0].timezone='WIB-7'
+set system.@system[0].zonename='Asia/Jakarta'
+commit system
+EOF
+# Tema LuCI (contoh): uci set luci.main.mediaurlbase='/luci-static/bootstrap'; uci commit luci
+exit 0
