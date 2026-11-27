@@ -1,0 +1,10 @@
+# config.user -- MILIKMU. Tidak ditimpa saat apply-stable.sh dijalankan ulang (kecuali --force).
+# Dibaca SETELAH config.base, jadi baris di sini menang atas config.base.
+#
+# Format:  CONFIG_PACKAGE_nama-paket=y        -> aktifkan
+#          (matikan: tulis baris "# CONFIG_PACKAGE_nama is not set" persis, tanpa # tambahan)
+#
+# Contoh (hapus tanda # di depan; tulis TANPA spasi setelah #):
+#CONFIG_PACKAGE_openssh-sftp-server=y
+#CONFIG_PACKAGE_luci-app-passwall=y
+#CONFIG_PACKAGE_luci-app-openclash=y

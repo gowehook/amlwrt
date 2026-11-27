@@ -1,0 +1,697 @@
+#============================================================================================
+# MANAGED by apply-stable.sh  -- jangan diedit langsung (akan ditimpa saat skrip dijalankan ulang).
+# Ubah default lewat opsi skrip (--tag/--board/--ip) atau isi input saat menjalankan workflow.
+#
+# Description: Build OpenWrt STABLE (tag resmi) + kernel OPHUB (compile sendiri / rilis) -> image
+# Meniru: build-openwrt-system-image.yml + compile-kernel.yml (workflow OPHUB asli tidak diubah)
+#============================================================================================
+
+name: Build OpenWrt stable with kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_tag:
+        description: "OpenWrt tag/branch (folder config/openwrt_<tag> harus ada)"
+        required: false
+        default: "v25.12.6"
+        type: string
+      openwrt_board:
+        description: "Board, mis. s905x atau gabungan s905x_s912 (lihat model_database.conf)"
+        required: false
+        default: "s905x"
+        type: string
+      kernel_mode:
+        description: "Sumber kernel: compile (build sekarang) | own-release (rilis repo ini) | ophub (ophub/kernel)"
+        required: false
+        default: "compile"
+        type: choice
+        options:
+          - compile
+          - own-release
+          - ophub
+      kernel_series:
+        description: "Seri kernel, pisahkan dengan _ (mis. 6.12.y atau 6.12.y_6.18.y)"
+        required: false
+        default: "6.12.y"
+        type: string
+      kernel_source:
+        description: "Sumber source kernel (khusus mode compile)"
+        required: false
+        default: "ophub"
+        type: choice
+        options:
+          - ophub
+          - unifreq
+      kernel_sign:
+        description: "Tanda tangan kernel (khusus mode compile), mis. -ophub"
+        required: false
+        default: "-ophub"
+        type: string
+      kernel_toolchain:
+        description: "Toolchain kompilasi kernel (khusus mode compile)"
+        required: false
+        default: "gcc"
+        type: choice
+        options:
+          - gcc
+          - clang
+          - gcc-15.3.rel2
+          - gcc-15.3
+          - gcc-15.2
+          - gcc-14.3
+          - gcc-14.2
+      kernel_auto:
+        description: "Pakai versi kernel terbaru dalam seri (compile & rilis)"
+        required: false
+        default: true
+        type: boolean
+      kernel_upload:
+        description: "Upload kernel hasil compile ke Release 'kernel_stable' repo ini (untuk dipakai ulang)"
+        required: false
+        default: true
+        type: boolean
+      openwrt_ip:
+        description: "IP default OpenWrt"
+        required: false
+        default: "192.168.1.1"
+        type: string
+      use_ccache:
+        description: "Pakai ccache untuk compile OpenWrt"
+        required: false
+        default: true
+        type: boolean
+      openwrt_storage:
+        description: "Tipe penyimpanan image (dipakai pada nama tag rilis)"
+        required: false
+        default: "save"
+        type: choice
+        options:
+          - save
+          - temp
+      builder_name:
+        description: "Tanda tangan builder OpenWrt"
+        required: false
+        default: "ophub"
+        type: string
+      openwrt_size:
+        description: "Ukuran rootfs (MiB). Kosong = default OPHUB"
+        required: false
+        default: ""
+        type: string
+      packager:
+        description: "Skrip packaging: upstream (ophub/amlogic-s9xxx-openwrt@main) atau fork (repo ini)"
+        required: false
+        default: "upstream"
+        type: choice
+        options:
+          - upstream
+          - fork
+
+env:
+  TZ: Etc/UTC
+  TOOLS_DIR: .github/openwrt-stable
+  KERNEL_DOCKER_TAG: resolute
+
+jobs:
+  #------------------------------------------------------------------
+  # 1) Validasi input & siapkan variabel
+  #------------------------------------------------------------------
+  setup:
+    runs-on: ${{ vars.SETUP_RUNNER || 'ubuntu-24.04' }}
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      config_dir: ${{ steps.vars.outputs.config_dir }}
+      build_tag: ${{ steps.vars.outputs.build_tag }}
+      kernel_matrix: ${{ steps.vars.outputs.kernel_matrix }}
+      kernel_compile: ${{ steps.vars.outputs.kernel_compile }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate inputs and prepare variables
+        id: vars
+        env:
+          IN_TAG: ${{ inputs.openwrt_tag }}
+          IN_BOARD: ${{ inputs.openwrt_board }}
+          IN_KERNEL_MODE: ${{ inputs.kernel_mode }}
+          IN_KERNEL_SERIES: ${{ inputs.kernel_series }}
+          IN_KERNEL_SIGN: ${{ inputs.kernel_sign }}
+          IN_IP: ${{ inputs.openwrt_ip }}
+          IN_STORAGE: ${{ inputs.openwrt_storage }}
+          IN_SIZE: ${{ inputs.openwrt_size }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          tag="${IN_TAG}"
+          [[ "${tag}" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?|openwrt-[0-9]+\.[0-9]+)$ ]] ||
+            fail "openwrt_tag tidak valid: '${tag}' (contoh: v25.12.6 atau openwrt-25.12)"
+          [[ "${IN_BOARD}" =~ ^[A-Za-z0-9._-]+(_[A-Za-z0-9._-]+)*$ ]] || fail "openwrt_board tidak valid: '${IN_BOARD}'"
+          [[ "${IN_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "openwrt_ip tidak valid: '${IN_IP}'"
+          [[ -z "${IN_SIZE}" || "${IN_SIZE}" =~ ^[0-9]+$ ]] || fail "openwrt_size harus angka (MiB): '${IN_SIZE}'"
+          [[ "${IN_KERNEL_SIGN}" =~ ^-[A-Za-z0-9]+$ ]] || fail "kernel_sign harus diawali '-' (mis. -ophub): '${IN_KERNEL_SIGN}'"
+
+          cfg="config/openwrt_${tag}"
+          for f in "${cfg}/config.base" "${cfg}/config.user" "${cfg}/diy-part1.sh" "${cfg}/diy-part2.sh" \
+                   "${TOOLS_DIR}/diy-core.sh" "${TOOLS_DIR}/check-config.sh" "${TOOLS_DIR}/check-rootfs.sh" \
+                   "${TOOLS_DIR}/prepare-kernel.sh"; do
+            [[ -f "${f}" ]] || fail "File wajib tidak ada: ${f} (jalankan apply-stable.sh lalu commit & push)"
+          done
+
+          # Pastikan tag/branch benar-benar ada di repo OpenWrt resmi
+          git ls-remote --exit-code --tags --heads https://github.com/openwrt/openwrt \
+            "refs/tags/${tag}" "refs/heads/${tag}" >/dev/null ||
+            fail "Tag/branch '${tag}' tidak ditemukan di github.com/openwrt/openwrt"
+
+          # Matrix seri kernel (hanya dipakai pada mode compile)
+          kernel_compile="false"
+          [[ "${IN_KERNEL_MODE}" == "compile" ]] && kernel_compile="true"
+          IFS='_' read -ra series <<<"${IN_KERNEL_SERIES}"
+          [[ "${#series[@]}" -ge 1 ]] || fail "kernel_series kosong"
+          for s in "${series[@]}"; do
+            [[ "${s}" =~ ^[0-9]+\.[0-9]+\.y$ ]] || fail "Seri kernel tidak valid: '${s}' (contoh: 6.12.y)"
+          done
+          matrix="$(jq -cn --arg s "${IN_KERNEL_SERIES}" '{include: ($s | split("_") | map({kernel_version: .}))}')"
+
+          {
+            echo "tag=${tag}"
+            echo "config_dir=${cfg}"
+            echo "build_tag=OpenWrt_openwrt_${tag}_${IN_STORAGE}_$(date +"%Y.%m")"
+            echo "kernel_compile=${kernel_compile}"
+            echo "kernel_matrix=${matrix}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag} | config=${cfg} | kernel_mode=${IN_KERNEL_MODE} | series=${IN_KERNEL_SERIES}"
+
+  #------------------------------------------------------------------
+  # 2) Compile kernel (meniru compile-kernel.yml OPHUB)
+  #------------------------------------------------------------------
+  kernel:
+    needs: setup
+    if: ${{ needs.setup.outputs.kernel_compile == 'true' }}
+    runs-on: ${{ vars.KERNEL_RUNNER || 'ubuntu-26.04-arm' }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.kernel_matrix) }}
+    name: kernel-${{ matrix.kernel_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo apt-get -y update
+          sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2604-build-armbian-depends)
+          sudo systemctl daemon-reload
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Get kernel source commit hash
+        id: kernelhash
+        env:
+          KSRC: ${{ inputs.kernel_source }}
+        run: |
+          api_url="https://api.github.com/repos/${KSRC}/linux-${{ matrix.kernel_version }}/git/ref/heads/main"
+          source_hash=$(curl -fsSL -m 20 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "${api_url}" | jq -r '.object.sha' || true)
+          [[ -z "${source_hash}" || "${source_hash}" == "null" ]] && source_hash="${{ github.sha }}"
+          echo "source_hash=${source_hash}" >> ${GITHUB_ENV}
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: /builder/ccache
+          key: kernel-${{ inputs.kernel_toolchain }}-${{ matrix.kernel_version }}-${{ env.source_hash }}
+          restore-keys: |
+            kernel-${{ inputs.kernel_toolchain }}-${{ matrix.kernel_version }}-
+
+      - name: Compile the kernel [ ${{ matrix.kernel_version }} ]
+        uses: ophub/amlogic-s9xxx-armbian@main
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        with:
+          build_target: kernel
+          kernel_source: ${{ inputs.kernel_source }}
+          kernel_version: ${{ matrix.kernel_version }}
+          kernel_auto: ${{ inputs.kernel_auto }}
+          delete_source: true
+          kernel_package: all
+          kernel_sign: ${{ inputs.kernel_sign }}
+          kernel_toolchain: ${{ inputs.kernel_toolchain }}
+          ccache_clear: false
+          docker_hostpath: /builder
+          docker_image: ophub/armbian-${{ env.KERNEL_DOCKER_TAG }}:arm64
+
+      - name: Verify kernel output
+        run: |
+          if [[ "${PACKAGED_STATUS:-}" != "success" ]]; then
+            echo "::error::Kompilasi kernel tidak berstatus success"
+            exit 1
+          fi
+          ls -lh "${PACKAGED_OUTPUTPATH}" || true
+          if ! compgen -G "${PACKAGED_OUTPUTPATH}/*" >/dev/null; then
+            echo "::error::Folder output kernel kosong: ${PACKAGED_OUTPUTPATH}"
+            exit 1
+          fi
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.kernel_version }}
+          path: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload kernel to Release (reuse later with kernel_mode=own-release)
+        uses: ophub/upload-to-releases@main
+        if: ${{ inputs.kernel_upload && !cancelled() }}
+        with:
+          tag: kernel_stable
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - Kernel hasil compile sendiri (source: `${{ inputs.kernel_source }}`, sign: `${{ inputs.kernel_sign }}`).
+            - Dipakai oleh workflow `Build OpenWrt stable with kernel` dengan `kernel_mode=own-release`.
+
+  #------------------------------------------------------------------
+  # 3) Compile OpenWrt stable -> rootfs.tar.gz (meniru build-openwrt-system-image.yml)
+  #------------------------------------------------------------------
+  openwrt:
+    needs: setup
+    runs-on: ${{ vars.OPENWRT_RUNNER || 'ubuntu-24.04' }}
+    permissions:
+      contents: write
+    name: openwrt-${{ needs.setup.outputs.tag }}
+    env:
+      TAG: ${{ needs.setup.outputs.tag }}
+      CFG_DIR: ${{ needs.setup.outputs.config_dir }}
+      BUILD_TAG: ${{ needs.setup.outputs.build_tag }}
+      OPENWRT_IP: ${{ inputs.openwrt_ip }}
+      USE_CCACHE: ${{ inputs.use_ccache }}
+      CCACHE_DIR: /builder/openwrt/.ccache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo apt-get -y update
+          sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo systemctl daemon-reload
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Clone source code [ ${{ needs.setup.outputs.tag }} ]
+        id: codes
+        working-directory: /builder
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          REPO_URL="https://github.com/openwrt/openwrt"
+          git clone -q --single-branch --depth=1 --branch="${TAG}" "${REPO_URL}" openwrt
+          ln -sfn /builder/openwrt "${GITHUB_WORKSPACE}/openwrt"
+
+          echo "source_hash=$(git -C /builder/openwrt rev-parse HEAD)" >> ${GITHUB_ENV}
+          echo -e "REPO_URL: [ ${REPO_URL} ]\nTAG: [ ${TAG} ]\nCOMMIT: [ $(git -C /builder/openwrt rev-parse --short HEAD) ]"
+          df -hT ${PWD}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Load custom feeds
+        run: |
+          if [[ -f "${CFG_DIR}/feeds.conf.default" ]]; then
+            cp -f "${CFG_DIR}/feeds.conf.default" openwrt/feeds.conf.default
+          fi
+          chmod +x "${CFG_DIR}/diy-part1.sh"
+          cd openwrt/
+          "${GITHUB_WORKSPACE}/${CFG_DIR}/diy-part1.sh"
+
+      - name: Update feeds
+        run: cd openwrt/ && ./scripts/feeds update -a
+
+      - name: Install feeds
+        run: cd openwrt/ && ./scripts/feeds install -a
+
+      - name: Load custom configuration
+        run: |
+          if [[ -d "${CFG_DIR}/files" ]]; then
+            rm -rf openwrt/files
+            cp -a "${CFG_DIR}/files" openwrt/files
+            find openwrt/files/etc/uci-defaults -type f -exec chmod +x {} + 2>/dev/null || true
+          fi
+          # config.base (dikelola skrip) + config.user (milikmu); baris belakangan menang
+          cat "${CFG_DIR}/config.base" "${CFG_DIR}/config.user" > openwrt/.config
+          chmod +x "${TOOLS_DIR}/diy-core.sh" "${CFG_DIR}/diy-part2.sh"
+          cd openwrt/
+          "${GITHUB_WORKSPACE}/${TOOLS_DIR}/diy-core.sh" "${OPENWRT_IP}" "${USE_CCACHE}" "${TAG}"
+          "${GITHUB_WORKSPACE}/${CFG_DIR}/diy-part2.sh" "${OPENWRT_IP}" "${USE_CCACHE}" "${TAG}"
+
+      - name: Download package
+        id: package
+        run: |
+          cd openwrt/
+          make defconfig
+          chmod +x "${GITHUB_WORKSPACE}/${TOOLS_DIR}/check-config.sh"
+          "${GITHUB_WORKSPACE}/${TOOLS_DIR}/check-config.sh" "${GITHUB_WORKSPACE}/${CFG_DIR}"
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: /builder/openwrt/.ccache
+          key: openwrt-stable-${{ needs.setup.outputs.tag }}-${{ env.source_hash }}
+          restore-keys: |
+            openwrt-stable-${{ needs.setup.outputs.tag }}-
+
+      - name: Compile the OpenWrt firmware
+        id: compile
+        run: |
+          cd openwrt/
+          echo -e "Compiling with $(nproc) threads"
+          make -j$(($(nproc) + 1)) V=s || make -j1 || make -j1 V=s
+
+          echo -e "ccache statistics:"
+          ccache -s 2>/dev/null || true
+          du -sh $(pwd)/.ccache 2>/dev/null || echo "No ccache directory found."
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Collect and verify rootfs
+        id: clean
+        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd openwrt/
+          mkdir -p output
+          ls -alh bin/targets/*/*/* || true
+          cp -f bin/targets/*/*/*-generic-rootfs.tar.gz output/
+          cp -f .config output/config
+          chmod +x "${GITHUB_WORKSPACE}/${TOOLS_DIR}/check-rootfs.sh"
+          "${GITHUB_WORKSPACE}/${TOOLS_DIR}/check-rootfs.sh" output/*rootfs.tar.gz \
+            "${GITHUB_WORKSPACE}/make-openwrt/openwrt-files/common-files"
+          ls -A | grep -vE '^(output|\.ccache)$' | xargs rm -rf || true
+          df -hT ${PWD}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        with:
+          name: openwrt-rootfs
+          path: |
+            openwrt/output/*rootfs.tar.gz
+            openwrt/output/config
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload OpenWrt rootfs to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.BUILD_TAG }}
+          artifacts: openwrt/output/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+  #------------------------------------------------------------------
+  # 4) Packaging OPHUB: rootfs + kernel -> image (.img.gz)
+  #------------------------------------------------------------------
+  package:
+    needs: [setup, kernel, openwrt]
+    if: ${{ !cancelled() && needs.openwrt.result == 'success' && (needs.kernel.result == 'success' || needs.kernel.result == 'skipped') }}
+    runs-on: ${{ vars.PACKAGE_RUNNER || 'ubuntu-24.04' }}
+    permissions:
+      contents: write
+    name: package-${{ needs.setup.outputs.tag }}
+    env:
+      BUILD_TAG: ${{ needs.setup.outputs.build_tag }}
+      KERNEL_MODE: ${{ inputs.kernel_mode }}
+      KERNEL_SERIES: ${{ inputs.kernel_series }}
+      KERNEL_AUTO: ${{ inputs.kernel_auto }}
+      PACKAGER: ${{ inputs.packager }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo apt-get -y update
+          sudo apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo systemctl daemon-reload
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openwrt-rootfs
+          path: stable-input
+
+      - name: Verify rootfs
+        run: |
+          chmod +x "${TOOLS_DIR}/check-rootfs.sh"
+          "${TOOLS_DIR}/check-rootfs.sh" stable-input/*rootfs.tar.gz make-openwrt/openwrt-files/common-files
+
+      - name: Download kernel artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ needs.setup.outputs.kernel_compile == 'true' }}
+        with:
+          pattern: kernel-*
+          merge-multiple: true
+          path: kernel-input
+
+      - name: Prepare packaging environment and kernel
+        id: prep
+        run: |
+          set -euo pipefail
+          if [[ "${PACKAGER}" == "fork" ]]; then
+            action_path="${GITHUB_WORKSPACE}"
+          else
+            action_path="/home/runner/work/_actions/ophub/amlogic-s9xxx-openwrt/main"
+          fi
+          [[ -d "${action_path}/make-openwrt" ]] || { echo "::error::Folder make-openwrt tidak ada di ${action_path}"; exit 1; }
+
+          # Hasil packaging ditaruh di virtual disk besar
+          mkdir -p /builder/openwrt
+          ln -sfn /builder/openwrt "${action_path}/openwrt"
+
+          case "${KERNEL_MODE}" in
+            compile)
+              chmod +x "${TOOLS_DIR}/prepare-kernel.sh"
+              versions="$("${TOOLS_DIR}/prepare-kernel.sh" kernel-input "${action_path}/make-openwrt/kernel" stable)"
+              [[ -n "${versions}" ]] || { echo "::error::Tidak ada kernel yang valid dari hasil compile"; exit 1; }
+              pkg_kernel="${versions}"; pkg_auto="false"; pkg_krepo="ophub/kernel"
+              ;;
+            own-release)
+              pkg_kernel="${KERNEL_SERIES}"; pkg_auto="${KERNEL_AUTO}"; pkg_krepo="${GITHUB_REPOSITORY}"
+              ;;
+            *)
+              pkg_kernel="${KERNEL_SERIES}"; pkg_auto="${KERNEL_AUTO}"; pkg_krepo="ophub/kernel"
+              ;;
+          esac
+
+          {
+            echo "PKG_KERNEL=${pkg_kernel}"
+            echo "PKG_AUTO=${pkg_auto}"
+            echo "PKG_KREPO=${pkg_krepo}"
+          } >> "${GITHUB_ENV}"
+          echo "action_path=${action_path}" >> "${GITHUB_OUTPUT}"
+          echo "Kernel mode=${KERNEL_MODE} | kernel=${pkg_kernel} | auto=${pkg_auto} | repo=${pkg_krepo}"
+          ls -R "${action_path}/make-openwrt/kernel" 2>/dev/null | head -40 || true
+
+      - name: Package OpenWrt (upstream packager)
+        if: ${{ inputs.packager == 'upstream' && !cancelled() }}
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: stable-input/*rootfs.tar.gz
+          openwrt_ip: ${{ inputs.openwrt_ip }}
+          openwrt_board: ${{ inputs.openwrt_board }}
+          openwrt_kernel: ${{ env.PKG_KERNEL }}
+          auto_kernel: ${{ env.PKG_AUTO }}
+          kernel_repo: ${{ env.PKG_KREPO }}
+          kernel_usage: stable
+          openwrt_size: ${{ inputs.openwrt_size }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: Package OpenWrt (fork packager)
+        if: ${{ inputs.packager == 'fork' && !cancelled() }}
+        uses: ./
+        with:
+          openwrt_path: stable-input/*rootfs.tar.gz
+          openwrt_ip: ${{ inputs.openwrt_ip }}
+          openwrt_board: ${{ inputs.openwrt_board }}
+          openwrt_kernel: ${{ env.PKG_KERNEL }}
+          auto_kernel: ${{ env.PKG_AUTO }}
+          kernel_repo: ${{ env.PKG_KREPO }}
+          kernel_usage: stable
+          openwrt_size: ${{ inputs.openwrt_size }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: Verify packaged images
+        run: |
+          if [[ "${PACKAGED_STATUS:-}" != "success" ]]; then
+            echo "::error::Packaging tidak berstatus success"
+            exit 1
+          fi
+          ls -lh "${PACKAGED_OUTPUTPATH}"
+          if ! compgen -G "${PACKAGED_OUTPUTPATH}/*.img.gz" >/dev/null; then
+            echo "::error::Tidak ada file .img.gz pada ${PACKAGED_OUTPUTPATH}"
+            exit 1
+          fi
+          {
+            echo "### Image hasil build"
+            echo "- OpenWrt: \`${{ needs.setup.outputs.tag }}\`"
+            echo "- Kernel: \`${PKG_KERNEL}\` (mode: \`${KERNEL_MODE}\`)"
+            echo "- Board: \`${{ inputs.openwrt_board }}\`"
+            echo
+            ls -lh "${PACKAGED_OUTPUTPATH}" | awk 'NR>1 {print "- " $9 " (" $5 ")"}'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload packaged OpenWrt to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.BUILD_TAG }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### OpenWrt Image Information
+            - OpenWrt: `${{ needs.setup.outputs.tag }}` (stable)
+            - Kernel: `${{ env.PKG_KERNEL }}` (mode: `${{ inputs.kernel_mode }}`)
+            - Default IP: `${{ inputs.openwrt_ip }}`
+            - Default username: `root`
+            - Default password: `password`
+            - Default WIFI name: `OpenWrt`
+            - Default WIFI password: `none`
+            ### Install to EMMC
+            - Login to OpenWrt → `System` → `Amlogic Service` → `Install OpenWrt`
+            ### OpenWrt source code
+            - [openwrt](https://github.com/openwrt/openwrt/tree/${{ needs.setup.outputs.tag }})
+            ### Applicable Platform
+            - 🐧 `arm64`
